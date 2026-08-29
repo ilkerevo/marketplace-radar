@@ -3,21 +3,58 @@ import { Radar, Zap } from "lucide-react"
 import { createClient } from "@/lib/supabase/server"
 import { signOutAction } from "@/app/actions/auth"
 
-export async function Navbar() {
+interface NavbarState {
+  user: { id: string; email: string | null } | null
+  credits: number | null
+}
+
+/**
+ * Navbar'ın veri ihtiyacını ayrı bir fonksiyonda topluyoruz ki
+ * try/catch tek bir yerden tüm olası hata noktalarını (env eksikliği,
+ * Supabase'e ulaşılamaması, sorgu hatası) yakalayabilsin.
+ */
+async function getNavbarState(): Promise<NavbarState> {
   const supabase = await createClient()
+
   const {
     data: { user },
   } = await supabase.auth.getUser()
 
-  let credits: number | null = null
-  if (user) {
-    const { data } = await supabase
-      .from("users")
-      .select("credits")
-      .eq("id", user.id)
-      .single()
-    credits = data?.credits ?? null
+  if (!user) {
+    return { user: null, credits: null }
   }
+
+  const { data } = await supabase
+    .from("users")
+    .select("credits")
+    .eq("id", user.id)
+    .single()
+
+  return {
+    user: { id: user.id, email: user.email ?? null },
+    credits: data?.credits ?? null,
+  }
+}
+
+export async function Navbar() {
+  let state: NavbarState = { user: null, credits: null }
+  let hasError = false
+
+  try {
+    state = await getNavbarState()
+  } catch (err) {
+    // Env variable eksik/yanlış ya da Supabase'e ulaşılamıyor olabilir.
+    // Navbar tüm sayfalarda (root layout'ta) render edildiği için burada
+    // fırlatılan bir hata SİTENİN TAMAMINI çökertir — bu yüzden asla
+    // dışarı fırlatmıyoruz, çıkış yapılmamış görünümüne düşüyoruz.
+    console.error(
+      "[Navbar] Kullanıcı/kredi bilgisi alınamadı, çıkış yapılmamış görünüm gösteriliyor:",
+      err
+    )
+    hasError = true
+  }
+
+  const { user, credits } = state
 
   return (
     <nav className="w-full border-b border-border">
@@ -28,6 +65,12 @@ export async function Navbar() {
             Marketplace Radar
           </span>
         </Link>
+
+        {hasError && (
+          <span className="hidden sm:block text-[11px] font-mono text-warning">
+            Bağlantı sorunu — bazı özellikler geçici olarak kısıtlı
+          </span>
+        )}
 
         {user ? (
           <div className="flex items-center gap-4">
