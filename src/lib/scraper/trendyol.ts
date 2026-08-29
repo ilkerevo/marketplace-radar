@@ -1,4 +1,5 @@
 import type { ReviewInput } from "@/lib/ai/analyzer"
+import { fetchWithTimeout } from "@/lib/scraper/fetch-with-timeout"
 
 // ---- Trendyol API yanıt tipleri (gözlemlenen yapı — değişebilir) ----
 interface TrendyolReviewRaw {
@@ -40,13 +41,27 @@ export interface ScrapedProductMeta {
   totalReviews: number | null
 }
 
+const REQUEST_TIMEOUT_MS = 10_000
+
+// Gerçek bir tarayıcı isteğine olabildiğince yakın header seti. Cloudflare/bot
+// koruması genelde sadece User-Agent'a değil, "sec-*" ve "Accept-*" header'larının
+// TUTARLI kombinasyonuna bakar — sadece User-Agent göndermek (eski hâli) bazı
+// korumalarda tek başına yetersiz kalabiliyor.
 const BASE_HEADERS = {
   "User-Agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
   Accept: "application/json, text/plain, */*",
   "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+  "Accept-Encoding": "gzip, deflate, br",
   Referer: "https://www.trendyol.com/",
   Origin: "https://www.trendyol.com",
+  Connection: "keep-alive",
+  "Sec-Fetch-Dest": "empty",
+  "Sec-Fetch-Mode": "cors",
+  "Sec-Fetch-Site": "same-site",
+  "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+  "sec-ch-ua-mobile": "?0",
+  "sec-ch-ua-platform": '"Windows"',
 }
 
 /**
@@ -83,18 +98,35 @@ async function fetchReviewPage(
 ): Promise<TrendyolReviewsApiResponse> {
   const url = `https://public-mdc.trendyol.com/discovery-web-socialgw-service/api/review/${contentId}?page=${page}&order=DESC&orderBy=Score`
 
-  const response = await fetch(url, {
-    headers: BASE_HEADERS,
-    cache: "no-store",
-  })
+  const response = await fetchWithTimeout(
+    url,
+    { headers: BASE_HEADERS, cache: "no-store" },
+    { timeoutMs: REQUEST_TIMEOUT_MS, label: `Trendyol review API (contentId: ${contentId}, page: ${page})` }
+  )
 
   if (!response.ok) {
+    // Body'yi de loglamak, 403/429 gibi durumlarda Trendyol'un bot koruması
+    // mesajını (varsa) görüp "gerçekten IP engeli mi" ayrımını yapmamızı sağlar.
+    const bodySnippet = await response.text().then(
+      (t) => t.slice(0, 300),
+      () => "(gövde okunamadı)"
+    )
+    console.error(
+      `[fetchReviewPage] Beklenmeyen HTTP durumu`,
+      JSON.stringify({ contentId, page, status: response.status, statusText: response.statusText, bodySnippet })
+    )
     throw new Error(
-      `Trendyol review API isteği başarısız (status: ${response.status}). Endpoint değişmiş olabilir.`
+      `Trendyol review API isteği başarısız (status: ${response.status}). ` +
+        (response.status === 403 || response.status === 429
+          ? "Bu durum kodu genelde bot korumasına takıldığını gösterir."
+          : "Endpoint değişmiş olabilir.")
     )
   }
 
-  return response.json()
+  return parseJsonSafely<TrendyolReviewsApiResponse>(
+    response,
+    `Trendyol review API (contentId: ${contentId}, page: ${page})`
+  )
 }
 
 /**
@@ -107,18 +139,55 @@ async function fetchProductDetail(
 ): Promise<TrendyolProductDetailApiResponse> {
   const url = `https://public-mdc.trendyol.com/discovery-web-productgw-service/api/productDetail/${contentId}`
 
-  const response = await fetch(url, {
-    headers: BASE_HEADERS,
-    cache: "no-store",
-  })
+  const response = await fetchWithTimeout(
+    url,
+    { headers: BASE_HEADERS, cache: "no-store" },
+    { timeoutMs: REQUEST_TIMEOUT_MS, label: `Trendyol product detail API (contentId: ${contentId})` }
+  )
 
   if (!response.ok) {
+    const bodySnippet = await response.text().then(
+      (t) => t.slice(0, 300),
+      () => "(gövde okunamadı)"
+    )
+    console.error(
+      `[fetchProductDetail] Beklenmeyen HTTP durumu`,
+      JSON.stringify({ contentId, status: response.status, statusText: response.statusText, bodySnippet })
+    )
     throw new Error(
-      `Trendyol product detail API isteği başarısız (status: ${response.status}). Endpoint değişmiş olabilir.`
+      `Trendyol product detail API isteği başarısız (status: ${response.status}). ` +
+        (response.status === 403 || response.status === 429
+          ? "Bu durum kodu genelde bot korumasına takıldığını gösterir."
+          : "Endpoint değişmiş olabilir.")
     )
   }
 
-  return response.json()
+  return parseJsonSafely<TrendyolProductDetailApiResponse>(
+    response,
+    `Trendyol product detail API (contentId: ${contentId})`
+  )
+}
+
+/**
+ * `response.json()`'ı güvenli şekilde çalıştırır. Bot koruması bazen 200 OK
+ * ile birlikte JSON yerine bir HTML "doğrulama/challenge" sayfası döndürür —
+ * bu durumda normal `.json()` anlaşılmaz bir "Unexpected token '<'" hatası
+ * fırlatır. Burada bunu yakalayıp ham gövdenin bir kısmını logluyoruz ki
+ * "endpoint mi değişti, yoksa bot koruması mı devrede" ayrımı yapılabilsin.
+ */
+async function parseJsonSafely<T>(response: Response, context: string): Promise<T> {
+  const rawText = await response.text()
+  try {
+    return JSON.parse(rawText) as T
+  } catch (err) {
+    console.error(
+      `[parseJsonSafely] ${context}: yanıt geçerli JSON değil`,
+      JSON.stringify({ bodySnippet: rawText.slice(0, 300) })
+    )
+    throw new Error(
+      `${context}: Trendyol'dan JSON yerine beklenmeyen bir yanıt geldi (muhtemelen bot koruması sayfası).`
+    )
+  }
 }
 
 /**
